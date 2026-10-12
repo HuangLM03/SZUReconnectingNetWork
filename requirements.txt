@@ -1,0 +1,7 @@
+# 双平台共用
+requests>=2.31,<3
+
+# 平台专属（按 sys_platform 环境标记安装）
+rumps>=0.4,<1; sys_platform == "darwin"
+pystray>=0.19.5,<1; sys_platform == "win32"
+Pillow>=10,<13; sys_platform == "win32"
