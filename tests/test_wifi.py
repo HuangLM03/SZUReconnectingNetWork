@@ -3,6 +3,7 @@ import unittest
 import unittest.mock
 
 from szu_guardian.wifi import (
+    reset_wifi_interface,
     current_ssid,
     find_wifi_interface,
     interface_has_ipv4,
@@ -237,3 +238,44 @@ class WindowsRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResetInterfaceTests(unittest.TestCase):
+    """reset_wifi_interface：僵局场景下无视现有 IP 强制重置接口。"""
+
+    def test_power_cycles_even_when_ip_is_present(self):
+        """僵局的关键：有 IP 也要重置（recover_wifi 在这种情况下不会动作）。"""
+        system = FakeWifiSystem(has_ip=True, powered=True)
+        messages: list[str] = []
+
+        ok = reset_wifi_interface(
+            "SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None
+        )
+
+        self.assertTrue(ok)
+        power_sequence = [
+            c[3] for c in system.commands if c[:2] == ["networksetup", "-setairportpower"]
+        ]
+        self.assertEqual(power_sequence, ["off", "on"])
+        self.assertTrue(any("重置 Wi-Fi 接口" in m for m in messages))
+
+    def test_joins_when_ip_missing_after_reset(self):
+        system = FakeWifiSystem(has_ip=False)
+
+        ok = reset_wifi_interface(
+            "SZU_WLAN", None, runner=system, sleeper=lambda _: None
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(system.join_calls, 1)  # 电源重启后显式加入兜底
+
+    def test_fails_gracefully_without_wifi_device(self):
+        system = FakeWifiSystem(wifi_device=None)
+        messages: list[str] = []
+
+        ok = reset_wifi_interface(
+            "SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None
+        )
+
+        self.assertFalse(ok)
+        self.assertTrue(any("未找到 Wi-Fi" in m for m in messages))

@@ -42,6 +42,10 @@ class ConnectionResult:
     connected: bool
     message: str
     latency_ms: int | None = None
+    # 门户是否已接受认证（即使外网未恢复）。用于监控层识别
+    # 「认证成功但外网不放行」的僵局——该状态重复认证无法解决，
+    # 需要重建链路绑定（重置网络接口）才能解开
+    auth_succeeded: bool = False
 
 
 def _new_direct_session() -> requests.Session:
@@ -269,6 +273,7 @@ class NetworkClient:
                     True,
                     "已自动重连，网络恢复正常",
                     verified.latency_ms,
+                    auth_succeeded=True,
                 )
             if progress_callback and attempt < len(self.verify_delays):
                 progress_callback(
@@ -278,4 +283,5 @@ class NetworkClient:
         return ConnectionResult(
             False,
             "认证服务器已确认请求，但外网仍不可用；请查看本地日志中的认证结果",
+            auth_succeeded=True,
         )

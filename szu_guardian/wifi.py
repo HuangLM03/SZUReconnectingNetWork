@@ -244,3 +244,56 @@ def _recover_win(interface, ssid, report, runner, sleeper) -> bool:
         f"无法连接 {ssid}；请先在系统设置中连接一次该网络以保存配置文件"
     )
     return False
+
+
+def reset_wifi_interface(
+    ssid: str = "",
+    progress_callback: Callable[[str], None] | None = None,
+    interface: str | None = None,
+    runner: CommandRunner = _default_runner,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool:
+    """强制重置 Wi-Fi 接口 —— 无论当前是否持有 IP。
+
+    用于「认证成功但外网持续不放行」的僵局：此时网卡有 IP、链路看似
+    正常，卡住的是 DHCP 绑定 / 网关放行等更深层状态，重复认证无法
+    触及，只能靠离开网络再回来重建（等价于手动切换网络的往返）。
+
+    - macOS：Wi-Fi 电源循环；系统会自动重连已知网络，配置了 SSID
+      时再显式加入兜底
+    - Windows：``netsh wlan disconnect`` 触发 WLAN 自动配置重连；
+      配置了 SSID 时显式连接（断开/连接均无需管理员权限）
+
+    返回接口重置后是否重新拿到 IPv4。
+    """
+    def report(message: str) -> None:
+        if progress_callback:
+            progress_callback(message)
+
+    wifi_interface = interface or find_wifi_interface(runner)
+    if not wifi_interface:
+        report("未找到 Wi-Fi 网卡，无法自动重置网络接口")
+        return False
+
+    report(f"正在重置 Wi-Fi 接口 {wifi_interface}（等价于手动断开重连）…")
+
+    if sys.platform == "win32":
+        runner(
+            ["netsh", "wlan", "disconnect", f'interface="{wifi_interface}"']
+        )
+        sleeper(5)
+        if ssid:
+            _join_win(wifi_interface, ssid, runner)
+    else:
+        set_wifi_power(wifi_interface, False, runner)
+        sleeper(2)
+        set_wifi_power(wifi_interface, True, runner)
+        sleeper(3)
+        if ssid and not interface_has_ipv4(wifi_interface, runner):
+            join_network(wifi_interface, ssid, runner)
+
+    if _wait_for_ipv4(wifi_interface, timeout=30.0, sleeper=sleeper, runner=runner):
+        report("Wi-Fi 接口重置完成，链路已重建，等待下一轮检测…")
+        return True
+    report("Wi-Fi 接口已重置但未在 30 秒内获得 IP 地址")
+    return False

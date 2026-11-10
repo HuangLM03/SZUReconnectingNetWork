@@ -109,6 +109,45 @@ class NetworkClientTests(unittest.TestCase):
         self.assertTrue(result.connected)
         self.assertIn("自动重连", result.message)
 
+
+    def test_auth_ok_but_web_never_recovers_carries_auth_signal(self):
+        """认证成功但外网不恢复时，结果必须携带 auth_succeeded 信号。"""
+        session = Mock()
+        session.headers = {}
+        calls = 0
+
+        def wedged_flow(url, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:  # 初始探测：离线
+                return response("http://portal.local", text="login")
+            if calls == 3:  # 门户接受认证
+                return response(
+                    "http://172.30.255.42:801/eportal/portal/login/",
+                    text='jsonpReturn({"result":1,"msg":"认证成功"});',
+                )
+            return response("http://portal.local", text="blocked")  # 复查仍离线
+
+        session.get.side_effect = wedged_flow
+        client = NetworkClient(
+            session=session,
+            portal_session=session,
+            sleeper=lambda _: None,
+            verify_delays=(0,),
+        )
+
+        result = client.ensure_connected(
+            AppConfig(
+                username="user",
+                password="password",
+                zone="dormitory",
+            )
+        )
+
+        self.assertFalse(result.connected)
+        self.assertTrue(result.auth_succeeded)
+
+
     def test_auto_mode_tries_teaching_first(self):
         session = Mock()
         session.headers = {}

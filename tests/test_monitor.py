@@ -252,6 +252,108 @@ class MonitorControllerTests(unittest.TestCase):
             )
         )
 
+    def test_auth_deadlock_escalates_to_interface_reset(self):
+        """连续 6 轮「认证成功但外网不恢复」→ 自动重置网络接口。"""
+        import szu_guardian.monitor as monitor_module
+
+        events: list[tuple[str, str]] = []
+        waits: list[float] = []
+        controller = MonitorController(
+            event_callback=lambda event: events.append((event.state, event.message)),
+            config_provider=lambda: AppConfig(
+                username="u", password="p", wifi_ssid="SZU_WLAN", interval_minutes=60
+            ),
+        )
+        wedged = ConnectionResult(
+            False,
+            "认证服务器已确认请求，但外网仍不可用；请查看本地日志中的认证结果",
+            auth_succeeded=True,
+        )
+        client = Mock()
+        client.ensure_connected.return_value = wedged
+
+        with (
+            patch.object(controller, "client_factory", return_value=client),
+            patch("szu_guardian.wifi.recover_wifi"),
+            patch("szu_guardian.wifi.reset_wifi_interface") as reset_mock,
+            patch.object(monitor_module, "RECOVERY_SETTLE_SECONDS", 0),
+            patch.object(monitor_module, "RECOVERY_RETRY_DELAY", 0),
+            patch.object(monitor_module, "RECOVERY_ATTEMPTS", 1),
+            patch.object(
+                monitor_module, "AUTH_DEADLOCK_ESCALATE_AFTER", 6
+            ),
+        ):
+            wake = controller._wake_event
+            original_wait = wake.wait
+
+            def fast_forward_or_stop(timeout=None):
+                waits.append(timeout)
+                if reset_mock.called:
+                    controller.stop()
+                    original_wait(timeout)  # stop 已置位，立即返回
+                # 未升级前直接返回：跳过真实的 5 分钟等待
+
+            wake.wait = fast_forward_or_stop
+
+            controller.start()
+            controller._thread.join(timeout=5)
+
+        reset_mock.assert_called_once()
+        self.assertEqual(reset_mock.call_args.kwargs.get("ssid"), "SZU_WLAN")
+        self.assertEqual(len(waits), 6)  # 6 轮僵局后升级
+        self.assertTrue(
+            any(
+                state == "reconnecting" and "重置 Wi-Fi 接口" in message
+                for state, message in events
+            )
+        )
+        self.assertEqual(controller.auth_deadlock_count, 0)  # 升级后清零重来
+
+    def test_deadlock_counter_resets_on_recovery(self):
+        """僵局计数在恢复成功后归零，不会误触发接口重置。"""
+        import szu_guardian.monitor as monitor_module
+
+        events: list[tuple[str, str]] = []
+        waits: list[float] = []
+        controller = MonitorController(
+            event_callback=lambda event: events.append((event.state, event.message)),
+            config_provider=lambda: AppConfig(
+                username="u", password="p", wifi_ssid="SZU_WLAN", interval_minutes=60
+            ),
+        )
+        # 每轮 2 次 ensure（本轮 + 恢复重试）：3 轮僵局后第 4 轮恢复
+        outcomes = [
+            ConnectionResult(False, "认证成功但外网不恢复", auth_succeeded=True)
+        ] * 6 + [ConnectionResult(True, "已自动重连，网络恢复正常", 20)]
+        client = Mock()
+        client.ensure_connected.side_effect = lambda config, progress_callback=None: outcomes.pop(0)
+
+        with (
+            patch.object(controller, "client_factory", return_value=client),
+            patch("szu_guardian.wifi.recover_wifi"),
+            patch("szu_guardian.wifi.reset_wifi_interface") as reset_mock,
+            patch.object(monitor_module, "RECOVERY_SETTLE_SECONDS", 0),
+            patch.object(monitor_module, "RECOVERY_RETRY_DELAY", 0),
+            patch.object(monitor_module, "RECOVERY_ATTEMPTS", 1),
+        ):
+            wake = controller._wake_event
+            original_wait = wake.wait
+
+            def fast_forward_or_stop(timeout=None):
+                waits.append(timeout)
+                if len(waits) >= 4:
+                    controller.stop()
+                    original_wait(timeout)
+
+            wake.wait = fast_forward_or_stop
+
+            controller.start()
+            controller._thread.join(timeout=5)
+
+        reset_mock.assert_not_called()
+        self.assertEqual(len(waits), 4)
+        self.assertEqual(controller.auth_deadlock_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
