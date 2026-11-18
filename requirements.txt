@@ -1,5 +1,6 @@
-# 双平台共用
-requests>=2.31,<3
+# 双平台共用（直连 TLS 适配层使用 urllib3 2.x 接口）
+requests>=2.32,<3
+urllib3>=2.2,<3
 
 # 平台专属（按 sys_platform 环境标记安装）
 rumps>=0.4,<1; sys_platform == "darwin"

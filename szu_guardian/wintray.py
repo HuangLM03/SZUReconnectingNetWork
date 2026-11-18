@@ -14,18 +14,9 @@ from PIL import Image, ImageDraw
 from .service import GuardianService
 
 
-STATE_LABELS = {
-    "online": "网络正常",
-    "checking": "正在检测",
-    "reconnecting": "正在重连",
-    "offline": "网络异常",
-    "stopped": "已停止",
-}
-
-# 图标颜色只反映健康语义；waiting 不是独立的视觉状态
-#（由 service.display_state 回落到最近一次检测结论）。
 STATE_COLORS = {
     "online": "#16A34A",
+    "degraded": "#CA8A04",
     "checking": "#2563EB",
     "reconnecting": "#D97706",
     "offline": "#DC2626",
@@ -78,11 +69,7 @@ class GuardianTrayApp:
     # 动态文本（pystray 支持 callable 菜单文本）
 
     def _status_text(self, _sender=None) -> str:
-        text = STATE_LABELS.get(self.service.display_state, "运行中")
-        event = self.service.last_event
-        if event is not None and event.latency_ms is not None:
-            text = f"{text} · {event.latency_ms} ms"
-        return f"状态：{text}"
+        return f"状态：{self.service.display_label}"
 
     def _toggle_text(self, _sender=None) -> str:
         return "暂停守护" if self.service.monitoring else "开始守护"

@@ -1,12 +1,8 @@
-"""GuardianService：双平台共享的桌面服务层。
-
-监控生命周期、设置子进程管理、事件分发（本地日志 + 恢复通知）、
-开机自启开关都收敛在这里；menubar（macOS）与 wintray（Windows）
-只做 UI 映射并轮询 ``drain_events`` / ``drain_ui_actions``。
-"""
+"""双平台共享桌面服务：事件、日志、通知与监控生命周期。"""
 
 from __future__ import annotations
 
+import datetime as dt
 import queue
 import subprocess
 import sys
@@ -34,26 +30,44 @@ class GuardianService:
         self.local_log = LocalLog()
         self._settings_process: subprocess.Popen | None = None
         self._last_event: MonitorEvent | None = None
+        self._last_health_event: MonitorEvent | None = None
         self._notified_offline = False
-        # 显示状态跟踪：waiting 等事件不应冲掉上一次检测的结果颜色
-        self._net_state: str | None = None  # 最近一次检测结论：online/offline
-        self._transient_state: str | None = None  # checking/reconnecting
-        # 前端注入：notify(message: str) -> None
+        self._generation = 0
+        self._net_state: str | None = None
+        self._transient_state: str | None = None
         self.notify: Callable[[str], None] = lambda message: None
-
-    # ------------------------------------------------------------------
-    # 状态读取（供前端动态菜单文本）
 
     @property
     def last_event(self) -> MonitorEvent | None:
         return self._last_event
 
     @property
+    def last_health_event(self) -> MonitorEvent | None:
+        return self._last_health_event
+
+    @property
     def display_state(self) -> str:
-        """前端应展示的状态：瞬时状态优先，否则回落到最近一次检测结论。"""
         if self._transient_state:
             return self._transient_state
         return self._net_state or "stopped"
+
+    @property
+    def display_label(self) -> str:
+        labels = {
+            "online": "上次检测互联网正常",
+            "degraded": "连接受限，未完全恢复",
+            "offline": "互联网未通过检测",
+            "checking": "正在严格检测",
+            "reconnecting": "正在恢复与复查",
+            "stopped": "已停止",
+        }
+        text = labels.get(self.display_state, "运行中")
+        health = self._last_health_event
+        if health and self.display_state in ("online", "offline", "degraded"):
+            text += dt.datetime.fromtimestamp(health.observed_at).strftime(" · %H:%M:%S")
+        if health and health.latency_ms is not None:
+            text += f" · {health.latency_ms} ms"
+        return text
 
     @property
     def monitoring(self) -> bool:
@@ -65,9 +79,6 @@ class GuardianService:
         except OSError:
             return False
 
-    # ------------------------------------------------------------------
-    # 事件泵：前端定时调用；写本地日志并在恢复时发通知
-
     def drain_events(self) -> list[MonitorEvent]:
         events: list[MonitorEvent] = []
         try:
@@ -75,29 +86,56 @@ class GuardianService:
                 events.append(self.events.get_nowait())
         except queue.Empty:
             pass
+
+        processed: list[MonitorEvent] = []
         for event in events:
+            # 旧代次的 stopped/offline 不得覆盖刚启动的新代次。
+            if event.generation and event.generation < self._generation:
+                continue
+            if event.generation > self._generation:
+                self._generation = event.generation
+            processed.append(event)
             self._last_event = event
-            self.local_log.write(event.message, event.level)
-            if event.state in ("online", "offline"):
+            self.local_log.write(
+                event.message,
+                event.level,
+                observed_at=event.observed_at,
+            )
+            for detail in event.details:
+                self.local_log.write(
+                    f"  诊断 · {detail}",
+                    "info",
+                    observed_at=event.observed_at,
+                )
+
+            if event.state == "started":
+                self._net_state = None
+                self._transient_state = None
+                self._last_health_event = None
+                self._notified_offline = False
+            elif event.state in ("online", "offline", "degraded"):
                 self._net_state = event.state
                 self._transient_state = None
+                self._last_health_event = event
             elif event.state in ("checking", "reconnecting"):
                 self._transient_state = event.state
             elif event.state == "stopped":
                 self._net_state = None
                 self._transient_state = None
+                self._last_health_event = None
+                self._notified_offline = False
             else:
-                # waiting 等「空档」事件：清掉瞬时状态，回落到最近一次检测结论，
-                # 但不改变 online/offline 的结论颜色
+                # waiting 只清瞬时状态，健康颜色仍代表上次结论及其时间。
                 self._transient_state = None
 
             if event.state == "online":
-                if self._notified_offline:
-                    self._notified_offline = False
+                should_notify = self._notified_offline or event.recovered
+                self._notified_offline = False
+                if should_notify:
                     self._notify_user(event.message)
-            elif event.state == "offline":
+            elif event.state in ("offline", "degraded"):
                 self._notified_offline = True
-        return events
+        return processed
 
     def drain_ui_actions(self) -> list[str]:
         actions: list[str] = []
@@ -113,9 +151,6 @@ class GuardianService:
             self.notify(message)
         except Exception:
             pass
-
-    # ------------------------------------------------------------------
-    # 监控控制
 
     def start_monitoring(self, silent: bool = False) -> None:
         config = self.store.load()
@@ -133,7 +168,7 @@ class GuardianService:
     def stop_monitoring(self) -> None:
         if self.monitor.running:
             self.monitor.stop()
-            self.local_log.write("用户暂停了守护")
+            self.local_log.write("用户请求暂停守护")
 
     def check_now(self) -> None:
         if self.monitor.running:
@@ -141,9 +176,6 @@ class GuardianService:
             self.local_log.write("用户请求立即检测")
         else:
             self.start_monitoring()
-
-    # ------------------------------------------------------------------
-    # 设置子进程
 
     def open_settings(self) -> None:
         if self._settings_process and self._settings_process.poll() is None:
@@ -178,9 +210,6 @@ class GuardianService:
         elif previous_running:
             self.monitor.stop()
 
-    # ------------------------------------------------------------------
-    # 其他动作
-
     def open_logs(self) -> None:
         try:
             self.local_log.open_directory()
@@ -191,8 +220,8 @@ class GuardianService:
         target = not self.autostart_enabled()
         try:
             set_autostart(target)
-        except OSError as exc:
-            self._notify_user(f"设置开机自启失败：{exc}")
+        except OSError:
+            self._notify_user("设置开机自启失败")
             return not target
         self.local_log.write("已开启开机自启" if target else "已关闭开机自启")
         return target

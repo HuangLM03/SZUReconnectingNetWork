@@ -14,6 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -105,12 +106,16 @@ def hmac_md5(password: str, challenge: str) -> str:
     ).hexdigest()
 
 
-def _parse_jsonp(text: str) -> dict[str, Any]:
-    match = re.search(r"^[^(]*\((.*)\)\s*;?\s*$", text.strip(), re.DOTALL)
-    if not match:
-        raise ConnectionError("认证服务器返回了无法识别的数据")
+def _parse_jsonp(text: str, expected_callback: str = "_") -> dict[str, Any]:
+    match = re.fullmatch(
+        r"([A-Za-z_$][\w$]*)\((.*)\)\s*;?\s*",
+        text.strip(),
+        re.DOTALL,
+    )
+    if not match or match.group(1) != expected_callback:
+        raise ConnectionError("认证服务器返回了无法识别或来源不符的 JSONP")
     try:
-        payload = json.loads(match.group(1))
+        payload = json.loads(match.group(2))
     except json.JSONDecodeError as exc:
         raise ConnectionError("认证服务器返回了无效 JSON") from exc
     if not isinstance(payload, dict):
@@ -123,6 +128,7 @@ class SrunLoginResult:
     success: bool
     message: str
     client_ip: str = ""
+    rejected: bool = False
 
 
 class SrunClient:
@@ -132,12 +138,12 @@ class SrunClient:
         password: str,
         session: requests.Session | None = None,
         base_url: str = SRUN_BASE_URL,
-        host_header: str | None = None,
+        expected_client_ip: str = "",
     ):
         self.username = username
         self.password = password
         self.base_url = base_url.rstrip("/")
-        self.host_header = host_header
+        self.expected_client_ip = expected_client_ip
         self.session = session or requests.Session()
         self.session.trust_env = False
         self.session.headers.update(
@@ -149,61 +155,67 @@ class SrunClient:
             }
         )
 
+    def _validate_origin(self, response: requests.Response) -> None:
+        expected = urlsplit(self.base_url)
+        actual = urlsplit(response.url or self.base_url)
+        if (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc):
+            raise ConnectionError("认证响应来自非预期服务器")
+
     def _get_jsonp(self, path: str, params: dict[str, str]) -> dict[str, Any]:
-        headers = {"Host": self.host_header} if self.host_header else None
         response = self.session.get(
             f"{self.base_url}{path}",
             params=params,
-            headers=headers,
             timeout=(4, 10),
-            verify=False,
+            verify=True,
             allow_redirects=False,
         )
         response.raise_for_status()
-        return _parse_jsonp(response.text)
+        self._validate_origin(response)
+        return _parse_jsonp(response.text, expected_callback="_")
 
     def discover_ac_id(self) -> str:
-        headers = {"Host": self.host_header} if self.host_header else None
-        try:
-            response = self.session.get(
-                f"{self.base_url}/",
-                headers=headers,
-                timeout=(3, 7),
-                verify=False,
-                allow_redirects=not bool(self.host_header),
-            )
-            search_text = response.text + " " + response.headers.get("Location", "")
-            match = re.search(r"ac_id=(\d+)", search_text)
-            if match:
-                return match.group(1)
-            if self.host_header:
+        errors: list[str] = []
+        for path in ("/", "/index_1.html"):
+            try:
                 response = self.session.get(
-                    f"{self.base_url}/index_1.html",
-                    headers=headers,
+                    f"{self.base_url}{path}",
                     timeout=(3, 7),
-                    verify=False,
+                    verify=True,
                     allow_redirects=False,
                 )
+                response.raise_for_status()
+                self._validate_origin(response)
                 match = re.search(r"ac_id=(\d+)", response.text)
                 if match:
                     return match.group(1)
-        except requests.RequestException:
-            pass
-        return "1"
+                errors.append(f"{path} 未包含 ac_id")
+            except (ConnectionError, requests.RequestException) as exc:
+                errors.append(f"{path}: {exc}")
+        raise ConnectionError(
+            "无法从校园门户确定 ac_id，未使用未经证实的默认值（"
+            + "；".join(errors)
+            + "）"
+        )
 
     def is_online(self) -> bool | None:
-        """Return the SRun session state, or ``None`` when it is unknown."""
+        """只报告校园会话状态；与公共互联网是否可达无关。"""
         status_data = self._get_jsonp(
             "/cgi-bin/rad_user_info",
             {"callback": "_"},
         )
-        result = str(
-            status_data.get("error") or status_data.get("res") or ""
-        ).strip().lower()
-        if result == "not_online_error":
-            return False
-        if result == "ok":
+        error = str(status_data.get("error") or "").strip().lower()
+        res = str(status_data.get("res") or "").strip().lower()
+        values = [value for value in (error, res) if value]
+        if values and all(value == "ok" for value in values):
+            returned_user = str(status_data.get("user_name") or "")
+            returned_ip = str(status_data.get("client_ip") or status_data.get("online_ip") or "")
+            if returned_user and returned_user != self.username:
+                return None
+            if self.expected_client_ip and returned_ip and returned_ip != self.expected_client_ip:
+                return None
             return True
+        if values and all(value == "not_online_error" for value in values):
+            return False
         return None
 
     def login(self) -> SrunLoginResult:
@@ -212,7 +224,9 @@ class SrunClient:
             "/cgi-bin/get_challenge",
             {"callback": "_", "username": self.username, "ip": ""},
         )
-        if challenge_data.get("error") not in ("ok", None, ""):
+        challenge_error = str(challenge_data.get("error") or "").strip().lower()
+        challenge_res = str(challenge_data.get("res") or "").strip().lower()
+        if challenge_error != "ok" or challenge_res not in ("", "ok"):
             message = str(
                 challenge_data.get("error_msg")
                 or challenge_data.get("error")
@@ -224,6 +238,12 @@ class SrunClient:
         client_ip = str(challenge_data.get("client_ip", ""))
         if not challenge or not client_ip:
             return SrunLoginResult(False, "认证服务器未返回 challenge 或客户端 IP")
+        if self.expected_client_ip and client_ip != self.expected_client_ip:
+            return SrunLoginResult(
+                False,
+                f"认证服务器识别的客户端 IP 为 {client_ip}，"
+                f"与当前直连接口 {self.expected_client_ip} 不一致",
+            )
 
         password_md5 = hmac_md5(self.password, challenge)
         info_json = json.dumps(
@@ -270,10 +290,13 @@ class SrunClient:
                 "type": "1",
             },
         )
+        error = str(portal_data.get("error") or "").strip().lower()
+        res = str(portal_data.get("res") or "").strip().lower()
+        st = portal_data.get("st")
         success = (
-            portal_data.get("error") == "ok"
-            or portal_data.get("res") == "ok"
-            or portal_data.get("st") == 1
+            error == "ok"
+            and res in ("", "ok")
+            and st in (None, "", 1, "1")
         )
         if success:
             return SrunLoginResult(True, "教学 / 办公区认证成功", client_ip)
@@ -284,4 +307,4 @@ class SrunClient:
             or portal_data.get("res")
             or "认证失败"
         )
-        return SrunLoginResult(False, message, client_ip)
+        return SrunLoginResult(False, message, client_ip, rejected=True)

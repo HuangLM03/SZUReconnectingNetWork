@@ -63,26 +63,21 @@ def run_headless_check(store: ConfigStore, detect_only: bool) -> int:
     client = NetworkClient()
 
     if detect_only:
-        result = client.check_connection()
-        print(f"{'在线' if result.connected else '离线'}：{result.message}"
-              + (f"（{result.latency_ms} ms）" if result.latency_ms is not None else ""))
+        result = client.check_connection(config)
+        print(json.dumps(result.public_dict(), ensure_ascii=False, indent=2))
         return 0 if result.connected else 1
 
     if not config.username or not config.password:
         print("尚未配置校园网账号：请先启动守护应用并完成设置", file=sys.stderr)
         return 2
 
-    print(f"账号：{config.username} · 区域：{config.zone} · 间隔：{config.interval_minutes} 分钟")
+    print(f"区域：{config.zone} · 间隔：{config.interval_minutes} 分钟")
 
     def progress(message: str) -> None:
         print(f"  · {message}")
 
     result = client.ensure_connected(config, progress_callback=progress)
-    print(json.dumps({
-        "connected": result.connected,
-        "message": result.message,
-        "latency_ms": result.latency_ms,
-    }, ensure_ascii=False))
+    print(json.dumps(result.public_dict(), ensure_ascii=False, indent=2))
     return 0 if result.connected else 1
 
 

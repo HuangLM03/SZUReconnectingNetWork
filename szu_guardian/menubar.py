@@ -14,18 +14,11 @@ from .service import GuardianService
 #（由 service.display_state 回落到最近一次检测结论）。
 STATE_TITLES = {
     "online": "🟢",
+    "degraded": "🟡",
     "checking": "🟡",
     "reconnecting": "🟠",
     "offline": "🔴",
     "stopped": "⚪️",
-}
-
-STATE_LABELS = {
-    "online": "网络正常",
-    "checking": "正在检测",
-    "reconnecting": "正在重连",
-    "offline": "网络异常",
-    "stopped": "已停止",
 }
 
 
@@ -92,11 +85,7 @@ class GuardianMenuBarApp(rumps.App):
     # 动态文本
 
     def _status_text(self) -> str:
-        text = STATE_LABELS.get(self.service.display_state, "运行中")
-        event = self.service.last_event
-        if event is not None and event.latency_ms is not None:
-            text = f"{text} · {event.latency_ms} ms"
-        return f"状态：{text}"
+        return f"状态：{self.service.display_label}"
 
     def _toggle_text(self) -> str:
         return "暂停守护" if self.service.monitoring else "开始守护"

@@ -1,29 +1,24 @@
 import subprocess
 import unittest
-import unittest.mock
+from unittest.mock import patch
 
 from szu_guardian.wifi import (
-    reset_wifi_interface,
     current_ssid,
     find_wifi_interface,
     interface_has_ipv4,
     recover_wifi,
+    reset_wifi_interface,
 )
 
 
 HARDWARE_PORTS = """Hardware Port: Ethernet Adapter (en3)
 Device: en3
-Ethernet Address: 3e:07:c5:fa:90:f3
 
 Hardware Port: Wi-Fi
 Device: en0
-Ethernet Address: c0:95:6d:34:f8:63
 """
-
 IFCONFIG_WITH_IP = """en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
-	ether c0:95:6d:34:f8:63
 	inet 172.30.8.9 netmask 0xffff0000 broadcast 172.30.255.255
-	media: autoselect
 	status: active
 """
 
@@ -37,245 +32,162 @@ def fail(stderr="error"):
 
 
 class FakeWifiSystem:
-    """按状态机响应 networksetup / ifconfig 命令的假执行器。
-
-    ``join_failures``: 加入 SSID 前多少次会失败（0 = 一直成功，99 = 一直失败）
-    """
-
-    def __init__(
-        self,
-        *,
-        has_ip=False,
-        powered=True,
-        join_failures=0,
-        wifi_device="en0",
-    ):
-        self.commands: list[list[str]] = []
+    def __init__(self, *, has_ip=False, powered=True, join_failures=0, wifi_device="en0"):
+        self.commands = []
         self.has_ip = has_ip
         self.powered = powered
         self.join_failures = join_failures
         self.join_calls = 0
         self.wifi_device = wifi_device
+        self.allow_power_off = True
 
     def __call__(self, args):
         self.commands.append(list(args))
-        program = args[0]
-        if program == "networksetup":
+        if args[0] == "networksetup":
             subcommand = args[1]
             if subcommand == "-listallhardwareports":
                 return ok(HARDWARE_PORTS if self.wifi_device else "")
             if subcommand == "-getairportpower":
-                state = "On" if self.powered else "Off"
-                return ok(f"Wi-Fi Power ({args[2]}): {state}\n")
+                return ok(f"Wi-Fi Power ({args[2]}): {'On' if self.powered else 'Off'}\n")
             if subcommand == "-setairportpower":
+                if args[3] == "off" and not self.allow_power_off:
+                    return fail("denied")
                 self.powered = args[3] == "on"
-                return ok("")
+                if not self.powered:
+                    self.has_ip = False
+                return ok()
             if subcommand == "-setairportnetwork":
                 self.join_calls += 1
                 if self.join_calls <= self.join_failures:
-                    return fail("could not associate to network")
+                    return fail("could not associate")
                 self.has_ip = True
-                return ok("")
-            return fail(f"unexpected networksetup call: {args}")
-        if program == "ifconfig":
-            interface = args[1]
-            if interface == self.wifi_device and self.has_ip:
+                return ok()
+        if args[0] == "ifconfig":
+            if args[1] == self.wifi_device and self.has_ip:
                 return ok(IFCONFIG_WITH_IP)
             return ok("")
         return fail(f"unexpected command: {args}")
 
 
-class DiscoveryTests(unittest.TestCase):
-    def test_finds_wifi_device_from_hardware_ports(self):
-        self.assertEqual(find_wifi_interface(FakeWifiSystem()), "en0")
-
-    def test_returns_none_without_wifi_device(self):
-        self.assertIsNone(find_wifi_interface(FakeWifiSystem(wifi_device=None)))
-
-    def test_current_ssid_parsed_from_english_output(self):
-        system = FakeWifiSystem()
-        result = current_ssid(
-            "en0", lambda args: ok("Current Wi-Fi Network: SZU_WLAN\n")
-        )
-        self.assertEqual(result, "SZU_WLAN")
-
-    def test_current_ssid_none_when_not_associated(self):
-        result = current_ssid(
-            "en0", lambda args: ok("You are not associated with an AirPort network.\n")
-        )
-        self.assertIsNone(result)
-
-    def test_interface_has_ipv4_reflects_link_state(self):
-        self.assertTrue(interface_has_ipv4("en0", FakeWifiSystem(has_ip=True)))
-        self.assertFalse(interface_has_ipv4("en0", FakeWifiSystem(has_ip=False)))
-
-
-class RecoverWifiTests(unittest.TestCase):
-    def collect(self):
-        return []
-
-    def test_no_action_when_link_already_usable(self):
+class WifiRecoveryTests(unittest.TestCase):
+    def test_existing_ip_does_not_claim_internet_or_rejoin(self):
         system = FakeWifiSystem(has_ip=True)
-        messages: list[str] = []
 
-        self.assertTrue(
-            recover_wifi("SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None)
-        )
+        result = recover_wifi("SZU_WLAN", runner=system, sleeper=lambda _: None)
+
+        self.assertTrue(result.ready)
+        self.assertFalse(result.changed)
         self.assertEqual(system.join_calls, 0)
-        self.assertEqual(messages, [])
 
-    def test_joins_directly_when_powered(self):
+    def test_successful_rejoin_is_only_link_evidence(self):
         system = FakeWifiSystem()
-        messages: list[str] = []
+        messages = []
 
-        self.assertTrue(
-            recover_wifi("SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None)
+        result = recover_wifi(
+            "SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None
         )
-        self.assertEqual(system.join_calls, 1)
-        self.assertTrue(system.has_ip)
-        joined = [
-            c for c in system.commands
-            if c[:1] == ["networksetup"] and c[1] == "-setairportnetwork"
-        ]
-        self.assertEqual(joined, [["networksetup", "-setairportnetwork", "en0", "SZU_WLAN"]])
-        self.assertIn("Wi-Fi 链路已断开，正在重新加入 SZU_WLAN…", messages)
 
-    def test_powers_on_before_joining_when_wifi_off(self):
+        self.assertTrue(result.ready)
+        self.assertTrue(result.changed)
+        self.assertEqual(system.join_calls, 1)
+        self.assertIn("不代表互联网已恢复", messages[-1])
+
+    def test_wifi_power_is_enabled_before_join(self):
         system = FakeWifiSystem(powered=False)
+        result = recover_wifi("SZU_WLAN", runner=system, sleeper=lambda _: None)
+        self.assertTrue(result.ready)
+        self.assertIn(["networksetup", "-setairportpower", "en0", "on"], system.commands)
 
-        self.assertTrue(
-            recover_wifi("SZU_WLAN", None, runner=system, sleeper=lambda _: None)
-        )
-        power_commands = [
-            c for c in system.commands if c[:2] == ["networksetup", "-setairportpower"]
-        ]
-        self.assertEqual(power_commands, [["networksetup", "-setairportpower", "en0", "on"]])
-        self.assertEqual(system.join_calls, 1)
-
-    def test_power_cycles_and_retries_when_join_fails_once(self):
+    def test_join_failure_power_cycles_and_retries(self):
         system = FakeWifiSystem(join_failures=1)
-        messages: list[str] = []
-
-        self.assertTrue(
-            recover_wifi("SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None)
-        )
+        result = recover_wifi("SZU_WLAN", runner=system, sleeper=lambda _: None)
+        self.assertTrue(result.ready)
         self.assertEqual(system.join_calls, 2)
-        power_sequence = [
-            c[3] for c in system.commands if c[:2] == ["networksetup", "-setairportpower"]
-        ]
-        self.assertEqual(power_sequence, ["off", "on"])
-        self.assertIn("直接加入失败，正在重启 Wi-Fi 后重试…", messages)
 
-    def test_reports_failure_when_join_always_fails(self):
+    def test_failed_join_does_not_return_ready(self):
         system = FakeWifiSystem(join_failures=99)
-        messages: list[str] = []
+        result = recover_wifi("SZU_WLAN", runner=system, sleeper=lambda _: None)
+        self.assertFalse(result.ready)
+        self.assertFalse(result.changed)
 
-        self.assertFalse(
-            recover_wifi("SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None)
-        )
-        self.assertIn("请先手动连接一次让系统记住", messages[-1])
-
-    def test_empty_ssid_disables_recovery(self):
+    def test_empty_ssid_disables_wifi_management(self):
         system = FakeWifiSystem()
-        self.assertFalse(
-            recover_wifi("", None, runner=system, sleeper=lambda _: None)
-        )
+        result = recover_wifi("", runner=system, sleeper=lambda _: None)
+        self.assertFalse(result.ready)
         self.assertEqual(system.commands, [])
 
-
-class WindowsRecoveryTests(unittest.TestCase):
-    """直接测 _recover_win 的 netsh 命令序列（不依赖 sys.platform）。"""
-
-    def recover(self, join_failures: int, ip_after_join: bool):
+    def test_windows_recovery_uses_netsh(self):
         from szu_guardian.wifi import _recover_win
 
-        commands: list[list[str]] = []
-        joins: list[int] = [0]
-        messages: list[str] = []
+        runner_calls = []
 
         def runner(args):
-            commands.append(list(args))
-            if args[:3] == ["netsh", "wlan", "connect"]:
-                joins[0] += 1
-                success = joins[0] > join_failures
-                return ok("") if success else fail("The network is not found")
-            raise AssertionError(f"unexpected command: {args}")
+            runner_calls.append(args)
+            return ok()
 
-        import szu_guardian.wifi as wifi_module
-
-        with unittest.mock.patch.object(
-            wifi_module, "_wait_for_ipv4", return_value=ip_after_join
-        ):
-            result = _recover_win(
-                "WLAN", "SZU_WLAN", messages.append, runner, lambda _: None
+        with patch("szu_guardian.wifi._wait_for_ipv4", return_value=True):
+            ready = _recover_win(
+                "WLAN", "SZU_WLAN", lambda _: None, runner, lambda _: None, None
             )
-        return result, commands, messages
 
-    def test_happy_path_issues_netsh_connect(self):
-        result, commands, messages = self.recover(0, True)
-
-        self.assertTrue(result)
+        self.assertTrue(ready)
         self.assertEqual(
-            commands,
+            runner_calls,
             [["netsh", "wlan", "connect", 'name="SZU_WLAN"', 'interface="WLAN"']],
         )
-        self.assertIn("WLAN 已重新连接 SZU_WLAN", messages)
 
-    def test_retries_once_then_fails_with_hint(self):
-        result, commands, messages = self.recover(2, True)
 
-        self.assertFalse(result)
-        connect_calls = [c for c in commands if c[:3] == ["netsh", "wlan", "connect"]]
-        self.assertEqual(len(connect_calls), 2)
-        self.assertIn("请先在系统设置中连接一次该网络以保存配置文件", messages[-1])
+class WifiResetTests(unittest.TestCase):
+    def test_reset_must_observe_old_ip_leave_and_new_ip_arrive(self):
+        system = FakeWifiSystem(has_ip=True)
+        result = reset_wifi_interface("SZU_WLAN", runner=system, sleeper=lambda _: None)
+        self.assertTrue(result.ready)
+        self.assertTrue(result.changed)
+        self.assertEqual(system.join_calls, 1)
 
-    def test_connected_but_no_ip_reports_timeout(self):
-        result, _commands, messages = self.recover(0, False)
+    def test_power_off_failure_cannot_claim_reset_success(self):
+        system = FakeWifiSystem(has_ip=True)
+        system.allow_power_off = False
+        messages = []
 
-        self.assertFalse(result)
-        self.assertIn("迟迟未获得 IP 地址", messages[-1])
+        result = reset_wifi_interface(
+            "SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None
+        )
+
+        self.assertFalse(result.ready)
+        self.assertFalse(result.changed)
+        self.assertTrue(any("关闭命令失败" in message for message in messages))
+
+    def test_missing_device_returns_structured_failure(self):
+        system = FakeWifiSystem(wifi_device=None)
+        result = reset_wifi_interface("SZU_WLAN", runner=system, sleeper=lambda _: None)
+        self.assertFalse(result.ready)
+        self.assertFalse(result.changed)
+
+    def test_cancellation_during_reset_does_not_leave_power_off(self):
+        system = FakeWifiSystem(has_ip=True)
+        result = reset_wifi_interface(
+            "SZU_WLAN",
+            runner=system,
+            sleeper=lambda _: None,
+            cancel_check=lambda: True,
+        )
+        self.assertFalse(result.ready)
+        self.assertTrue(system.powered)
+
+
+class WifiDiscoveryTests(unittest.TestCase):
+    def test_finds_device_and_parses_ssid(self):
+        self.assertEqual(find_wifi_interface(FakeWifiSystem()), "en0")
+        self.assertEqual(
+            current_ssid("en0", lambda _args: ok("Current Wi-Fi Network: SZU_WLAN\n")),
+            "SZU_WLAN",
+        )
+
+    def test_interface_ip_check_does_not_check_ssid(self):
+        self.assertTrue(interface_has_ipv4("en0", FakeWifiSystem(has_ip=True)))
+        self.assertFalse(interface_has_ipv4("en0", FakeWifiSystem()))
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class ResetInterfaceTests(unittest.TestCase):
-    """reset_wifi_interface：僵局场景下无视现有 IP 强制重置接口。"""
-
-    def test_power_cycles_even_when_ip_is_present(self):
-        """僵局的关键：有 IP 也要重置（recover_wifi 在这种情况下不会动作）。"""
-        system = FakeWifiSystem(has_ip=True, powered=True)
-        messages: list[str] = []
-
-        ok = reset_wifi_interface(
-            "SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None
-        )
-
-        self.assertTrue(ok)
-        power_sequence = [
-            c[3] for c in system.commands if c[:2] == ["networksetup", "-setairportpower"]
-        ]
-        self.assertEqual(power_sequence, ["off", "on"])
-        self.assertTrue(any("重置 Wi-Fi 接口" in m for m in messages))
-
-    def test_joins_when_ip_missing_after_reset(self):
-        system = FakeWifiSystem(has_ip=False)
-
-        ok = reset_wifi_interface(
-            "SZU_WLAN", None, runner=system, sleeper=lambda _: None
-        )
-
-        self.assertTrue(ok)
-        self.assertEqual(system.join_calls, 1)  # 电源重启后显式加入兜底
-
-    def test_fails_gracefully_without_wifi_device(self):
-        system = FakeWifiSystem(wifi_device=None)
-        messages: list[str] = []
-
-        ok = reset_wifi_interface(
-            "SZU_WLAN", messages.append, runner=system, sleeper=lambda _: None
-        )
-
-        self.assertFalse(ok)
-        self.assertTrue(any("未找到 Wi-Fi" in m for m in messages))

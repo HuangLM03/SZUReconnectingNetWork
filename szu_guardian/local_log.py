@@ -24,8 +24,17 @@ class LocalLog:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.cleanup()
 
-    def write(self, message: str, level: str = "info") -> None:
-        now = dt.datetime.now()
+    def write(
+        self,
+        message: str,
+        level: str = "info",
+        observed_at: float | None = None,
+    ) -> None:
+        now = (
+            dt.datetime.fromtimestamp(observed_at)
+            if observed_at is not None
+            else dt.datetime.now()
+        )
         safe_message = " ".join(str(message).splitlines())
         line = f"{now:%Y-%m-%d %H:%M:%S} [{level.upper()}] {safe_message}\n"
         path = self.directory / f"guardian-{now:%Y-%m-%d}.log"

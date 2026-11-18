@@ -1,30 +1,28 @@
-"""直连（绑定物理网卡）网络层，Windows 与 macOS 双平台。
+"""绑定物理网卡的直连传输，Windows 与 macOS 双平台。
 
-目的：当系统运行 VPN / 代理（TUN fake-IP）时，让检测与认证流量走真实
-校园网网卡。
-
-- 网卡枚举：macOS 解析 ``ifconfig -a`` + ``scutil --dns``；
-  Windows 通过 ``GetAdaptersAddresses``（ctypes，移植自上游原版，
-  额外捕获 FriendlyName / IfIndex / IfType）
-- 接口钉定：macOS 用 ``IP_BOUND_IF``；Windows 用 ``IP_UNICAST_IF``
-  （值需网络字节序，即 ``socket.ntohl(if_index)``，历史性坑）
-- 直连 DNS 查询与源地址绑定的 requests 会话为双平台共用实现
+直连 DNS 只决定 TCP 连接目标，不再改写 requests 中的 URL。HTTPS 的
+SNI、证书链和主机名验证始终使用原始域名；公共 Internet 与校园门户
+使用独立连接池和不同的目标地址策略。
 """
 
 from __future__ import annotations
 
+import ctypes
 import ipaddress
-import random
+import secrets
 import socket
 import struct
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import NewConnectionError
+from urllib3.util.connection import create_connection
 
 
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
@@ -36,21 +34,17 @@ DIRECT_DNS_SERVERS = (
     "114.114.114.114",
 )
 
-# macOS netinet/in.h：把 socket 钉在指定接口上（接口作用域路由）。
-# 仅绑定源地址不足以绕过 VPN/TUN：默认路由指向 utun 时，内核会因
-# 源地址不属于出接口而报 Errno 49（Can't assign requested address）。
+# macOS netinet/in.h：源地址绑定不足以绕过 TUN，必须同时钉定接口。
 IP_BOUND_IF = 25
 # Windows ws2ipdef.h 的等价选项；值要求网络字节序的接口索引。
 IP_UNICAST_IF = 31
 
-# Windows GetAdaptersAddresses 相关常量
 WINDOWS_NO_ERROR = 0
 WINDOWS_ERROR_BUFFER_OVERFLOW = 111
 WINDOWS_IF_OPER_STATUS_UP = 1
-WINDOWS_IF_TYPE_IEEE80211 = 71  # WLAN
-WINDOWS_GAA_FLAGS = 0x0002 | 0x0004  # Skip anycast and multicast addresses.
+WINDOWS_IF_TYPE_IEEE80211 = 71
+WINDOWS_GAA_FLAGS = 0x0002 | 0x0004
 
-# macOS 虚拟 / 本地回环接口：直连时不应绑定到这些网卡
 SKIPPED_INTERFACE_PREFIXES = (
     "lo",
     "utun",
@@ -76,8 +70,8 @@ class AdapterDnsConfig:
     interface: str
     source_ip: str
     dns_servers: tuple[str, ...]
-    if_index: int = 0  # Windows: IfIndex；macOS 运行时用 if_nametoindex
-    is_wlan: bool = False  # Windows: IfType==71；macOS 不区分
+    if_index: int = 0
+    is_wlan: bool = False
 
 
 def _valid_source_ipv4(address: str) -> bool:
@@ -109,6 +103,27 @@ def _valid_dns_ipv4(address: str) -> bool:
     )
 
 
+def _valid_target_ipv4(address: str, *, allow_private: bool) -> bool:
+    """连接前再次检查目标；DNS 缓存命中也不能绕过此策略。"""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if (
+        parsed.version != 4
+        or parsed.is_unspecified
+        or parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_multicast
+        or parsed.is_reserved
+        or parsed in FAKE_IP_NETWORK
+    ):
+        return False
+    if allow_private:
+        return parsed.is_global or parsed.is_private
+    return parsed.is_global
+
+
 def _merge_dns_servers(*groups: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(server for group in groups for server in group))
 
@@ -130,44 +145,38 @@ def _run_command(args: list[str]) -> str:
 
 
 def _parse_ifconfig(output: str) -> list[tuple[str, str]]:
-    """Return ``(interface, ipv4)`` pairs for active, physical interfaces."""
-    candidates: list[tuple[str, str]] = []
-    current_interface = ""
-    interface_active = False
-
+    """先读完接口块再判断活跃状态，兼容 inet 位于 status 前面的输出。"""
+    blocks: list[list[str]] = []
+    current: list[str] = []
     for line in output.splitlines():
-        stripped = line.strip()
-        if not line:
-            continue
-        is_header = not line[0].isspace()
-        if is_header:
-            current_interface = line.split(":", 1)[0]
-            interface_active = "RUNNING" in line
-            continue
-        if not current_interface:
-            continue
+        if line and not line[0].isspace():
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current and line.strip():
+            current.append(line)
+    if current:
+        blocks.append(current)
 
-        if stripped.startswith("status:"):
-            interface_active = stripped == "status: active" or interface_active
+    candidates: list[tuple[str, str]] = []
+    for block in blocks:
+        interface = block[0].split(":", 1)[0]
+        if interface.startswith(SKIPPED_INTERFACE_PREFIXES):
             continue
-        if not interface_active:
-            continue
+        active = "RUNNING" in block[0]
+        addresses: list[str] = []
+        for line in block[1:]:
+            stripped = line.strip()
+            if stripped in ("status: active", "status: inactive"):
+                active = stripped == "status: active"
+            elif stripped.startswith("inet "):
+                address = stripped.split()[1]
+                if _valid_source_ipv4(address):
+                    addresses.append(address)
+        if active:
+            candidates.extend((interface, address) for address in addresses)
 
-        if stripped.startswith("inet "):
-            address = stripped.split()[1]
-            if (
-                _valid_source_ipv4(address)
-                and not current_interface.startswith(SKIPPED_INTERFACE_PREFIXES)
-            ):
-                candidates.append((current_interface, address))
-
-    seen: set[tuple[str, str]] = set()
-    unique: list[tuple[str, str]] = []
-    for item in candidates:
-        if item not in seen:
-            seen.add(item)
-            unique.append(item)
-    return unique
+    return list(dict.fromkeys(candidates))
 
 
 def _parse_scutil_dns(output: str) -> tuple[str, ...]:
@@ -184,13 +193,11 @@ def _parse_scutil_dns(output: str) -> tuple[str, ...]:
 def macos_adapter_dns_configs(
     command_runner=_run_command,
 ) -> list[AdapterDnsConfig]:
-    """Discover active IPv4 interfaces and the system DNS servers."""
     try:
         interface_output = command_runner(["ifconfig", "-a"])
     except (OSError, subprocess.SubprocessError):
         interface_output = ""
 
-    dns_servers: tuple[str, ...] = ()
     try:
         dns_servers = _parse_scutil_dns(command_runner(["scutil", "--dns"]))
     except (OSError, subprocess.SubprocessError):
@@ -216,11 +223,6 @@ def macos_adapter_dns_configs(
 
 
 def windows_adapter_dns_configs() -> list[AdapterDnsConfig]:
-    """Read active IPv4 addresses and their DNS servers via GetAdaptersAddresses.
-
-    移植自上游 Windows 原版，额外捕获 FriendlyName / IfIndex / IfType，
-    供接口钉定与 Wi-Fi 模块使用。
-    """
     if sys.platform != "win32":
         return []
 
@@ -323,7 +325,6 @@ def windows_adapter_dns_configs() -> list[AdapterDnsConfig]:
 
             friendly_name = current.FriendlyName or ""
             is_wlan = current.IfType == WINDOWS_IF_TYPE_IEEE80211
-
             unicast_address = current.FirstUnicastAddress
             while unicast_address:
                 address = ipv4_from_socket_address(unicast_address.contents.Address)
@@ -350,7 +351,6 @@ def windows_adapter_dns_configs() -> list[AdapterDnsConfig]:
 
 
 def discover_adapter_configs() -> list[AdapterDnsConfig]:
-    """平台分派：枚举可用的物理网卡直连配置。"""
     if sys.platform == "win32":
         return windows_adapter_dns_configs()
     return macos_adapter_dns_configs()
@@ -364,16 +364,18 @@ def _adapter_preference(config: AdapterDnsConfig) -> tuple[bool, bool]:
 
 
 # ---------------------------------------------------------------------------
-# 接口钉定（双平台）
+# 接口钉定
 
 
-def _pin_value(interface: str, if_index: int, platform: str | None = None) -> tuple[int, int, int] | None:
-    """返回 (level, optname, value)；无法钉定时返回 None。"""
+def _pin_value(
+    interface: str,
+    if_index: int,
+    platform: str | None = None,
+) -> tuple[int, int, int] | None:
     platform = platform or sys.platform
     if platform == "win32":
         if not if_index:
             return None
-        # IP_UNICAST_IF 要求接口索引为网络字节序
         return (socket.IPPROTO_IP, IP_UNICAST_IF, socket.ntohl(if_index))
     if interface:
         return (socket.IPPROTO_IP, IP_BOUND_IF, socket.if_nametoindex(interface))
@@ -382,23 +384,52 @@ def _pin_value(interface: str, if_index: int, platform: str | None = None) -> tu
 
 def _pin_socket(sock: socket.socket, interface: str, if_index: int) -> None:
     pin = _pin_value(interface, if_index)
-    if pin:
-        sock.setsockopt(*pin)
+    if pin is None:
+        raise DirectNetworkError("无法钉定物理网卡，已停止不安全的直连回退")
+    sock.setsockopt(*pin)
 
 
 # ---------------------------------------------------------------------------
-# 直连 DNS
+# 严格直连 DNS
 
 
-def _skip_dns_name(packet: bytes, offset: int) -> int:
-    while offset < len(packet):
+def _read_dns_name(
+    packet: bytes,
+    offset: int,
+    *,
+    _visited: set[int] | None = None,
+) -> tuple[str, int]:
+    """读取 DNS 名称并返回名称与下一个字段位置，拒绝压缩指针环路。"""
+    visited = set() if _visited is None else _visited
+    labels: list[str] = []
+    next_offset: int | None = None
+    while True:
+        if offset >= len(packet):
+            raise DirectNetworkError("直连 DNS 名称越界")
         length = packet[offset]
         if length & 0xC0 == 0xC0:
-            return offset + 2
+            if offset + 2 > len(packet):
+                raise DirectNetworkError("直连 DNS 压缩指针越界")
+            pointer = ((length & 0x3F) << 8) | packet[offset + 1]
+            if next_offset is None:
+                next_offset = offset + 2
+            if pointer in visited or pointer >= len(packet):
+                raise DirectNetworkError("直连 DNS 压缩指针无效")
+            visited.add(pointer)
+            offset = pointer
+            continue
+        if length & 0xC0:
+            raise DirectNetworkError("直连 DNS 名称标签无效")
+        offset += 1
         if length == 0:
-            return offset + 1
-        offset += length + 1
-    raise DirectNetworkError("直连 DNS 返回了无效数据")
+            return ".".join(labels).lower(), next_offset if next_offset is not None else offset
+        if length > 63 or offset + length > len(packet):
+            raise DirectNetworkError("直连 DNS 名称标签越界")
+        try:
+            labels.append(packet[offset : offset + length].decode("ascii").lower())
+        except UnicodeDecodeError as exc:
+            raise DirectNetworkError("直连 DNS 名称不是有效 ASCII") from exc
+        offset += length
 
 
 def query_a_record(
@@ -409,7 +440,7 @@ def query_a_record(
     interface: str = "",
     if_index: int = 0,
 ) -> list[str]:
-    transaction_id = random.randint(0, 0xFFFF)
+    transaction_id = secrets.randbits(16)
     labels = hostname.rstrip(".").split(".")
     question_name = b"".join(
         bytes((len(label.encode("idna")),)) + label.encode("idna")
@@ -425,83 +456,175 @@ def query_a_record(
     try:
         sock.settimeout(timeout)
         sock.bind((source_ip, 0))
-        if interface or if_index:
-            # 强制从物理接口发出，避免 VPN/TUN 抢走 DNS 流量
-            _pin_socket(sock, interface, if_index)
-        sock.sendto(packet, (dns_server, 53))
-        response, _ = sock.recvfrom(4096)
+        _pin_socket(sock, interface, if_index)
+        # connected UDP 只接收指定 DNS 服务器发来的数据报。
+        sock.connect((dns_server, 53))
+        sock.send(packet)
+        response = sock.recv(4096)
     finally:
         sock.close()
 
     if len(response) < 12:
         raise DirectNetworkError("直连 DNS 响应过短")
-    response_id, flags, question_count, answer_count, authority_count, extra_count = (
+    response_id, flags, question_count, answer_count, _authority, _extra = (
         struct.unpack("!HHHHHH", response[:12])
     )
-    if response_id != transaction_id or flags & 0x000F:
-        raise DirectNetworkError("直连 DNS 查询失败")
+    if (
+        response_id != transaction_id
+        or not flags & 0x8000
+        or (flags >> 11) & 0xF
+        or flags & 0x0200
+        or flags & 0x000F
+        or question_count != 1
+    ):
+        raise DirectNetworkError("直连 DNS 响应头或返回码无效")
 
     offset = 12
-    for _ in range(question_count):
-        offset = _skip_dns_name(response, offset) + 4
+    question, offset = _read_dns_name(response, offset)
+    if offset + 4 > len(response):
+        raise DirectNetworkError("直连 DNS 问题区不完整")
+    query_type, query_class = struct.unpack("!HH", response[offset : offset + 4])
+    offset += 4
+    expected_name = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    if question != expected_name or query_type != 1 or query_class != 1:
+        raise DirectNetworkError("直连 DNS 响应与查询问题不一致")
 
-    addresses: list[str] = []
-    for _ in range(answer_count + authority_count + extra_count):
-        offset = _skip_dns_name(response, offset)
+    aliases: dict[str, str] = {}
+    answers: dict[str, list[str]] = {}
+    for _ in range(answer_count):
+        owner, offset = _read_dns_name(response, offset)
         if offset + 10 > len(response):
-            break
+            raise DirectNetworkError("直连 DNS 答案区不完整")
         record_type, record_class, _ttl, length = struct.unpack(
             "!HHIH", response[offset : offset + 10]
         )
         offset += 10
-        value = response[offset : offset + length]
+        if offset + length > len(response):
+            raise DirectNetworkError("直连 DNS 记录数据越界")
+        value_offset = offset
         offset += length
-        if record_type == 1 and record_class == 1 and length == 4:
-            address = socket.inet_ntoa(value)
+        if record_class != 1:
+            continue
+        if record_type == 5 and length:
+            target, _ = _read_dns_name(response, value_offset)
+            aliases[owner] = target
+        elif record_type == 1 and length == 4:
+            address = socket.inet_ntoa(response[value_offset : offset])
             if ipaddress.ip_address(address) not in FAKE_IP_NETWORK:
-                addresses.append(address)
+                answers.setdefault(owner, []).append(address)
+
+    # 只沿查询名的 CNAME 链接受 A 记录；authority/additional 不参与答案。
+    addresses: list[str] = []
+    current = expected_name
+    visited_names: set[str] = set()
+    while current not in visited_names:
+        visited_names.add(current)
+        addresses.extend(answers.get(current, ()))
+        if current not in aliases:
+            break
+        current = aliases[current]
     return list(dict.fromkeys(addresses))
 
 
-def local_ipv4_candidates() -> list[str]:
-    try:
-        adapter_addresses = [
-            config.source_ip for config in discover_adapter_configs()
-        ]
-    except (OSError, subprocess.SubprocessError):
-        adapter_addresses = []
-    if adapter_addresses:
-        return list(dict.fromkeys(adapter_addresses))
-
-    try:
-        addresses = socket.gethostbyname_ex(socket.gethostname())[2]
-    except socket.gaierror as exc:
-        raise DirectNetworkError("无法读取本机网卡地址") from exc
-
-    valid = [address for address in addresses if _valid_source_ipv4(address)]
-    valid.sort(
-        key=lambda value: ipaddress.ip_address(value) not in PREFERRED_CAMPUS_NETWORK
-    )
-    return valid
-
-
 # ---------------------------------------------------------------------------
-# 绑定接口的 requests 会话
+# 保留原 URL/TLS 主机名的自定义直连连接
 
 
-class SourceAddressAdapter(HTTPAdapter):
+class DirectConnectionMixin:
+    """只替换 TCP 目标，不触碰 self.host、SNI 或证书校验。"""
+
+    def _new_conn(self):
+        try:
+            addresses = self.direct_route.resolve(self._dns_host)
+        except (OSError, DirectNetworkError) as exc:
+            raise NewConnectionError(self, f"直连解析失败：{exc}") from exc
+
+        errors: list[str] = []
+        for address in addresses:
+            if not _valid_target_ipv4(address, allow_private=self.allow_private):
+                errors.append(f"拒绝目标 {address}")
+                continue
+            try:
+                return create_connection(
+                    (address, self.port),
+                    timeout=self.timeout,
+                    source_address=self.source_address,
+                    socket_options=self.socket_options,
+                )
+            except OSError as exc:
+                errors.append(f"{address}: {exc}")
+        detail = "；".join(errors) or "没有符合策略的 IPv4 地址"
+        raise NewConnectionError(self, f"无法建立直连：{detail}")
+
+
+class DirectHTTPConnection(DirectConnectionMixin, HTTPConnection):
+    pass
+
+
+class DirectHTTPSConnection(DirectConnectionMixin, HTTPSConnection):
+    pass
+
+
+class DirectPoolMixin:
+    def _new_conn(self):
+        # 必须在 HTTPSConnectionPool._validate_conn() 调用 connect() 之前
+        # 注入路由，不能只在 super() 返回后再补属性。
+        connection = self.ConnectionCls(host=self.host, port=self.port, **self.conn_kw)
+        connection.direct_route = self.direct_route
+        connection.allow_private = self.allow_private
+        return connection
+
+
+class DirectHTTPConnectionPool(DirectPoolMixin, HTTPConnectionPool):
+    ConnectionCls = DirectHTTPConnection
+
+
+class DirectHTTPSConnectionPool(DirectPoolMixin, HTTPSConnectionPool):
+    ConnectionCls = DirectHTTPSConnection
+
+
+class DirectPoolManager(PoolManager):
     def __init__(
         self,
-        source_ip: str,
-        *args,
-        interface: str = "",
-        if_index: int = 0,
-        **kwargs,
+        num_pools: int,
+        maxsize: int,
+        block: bool = False,
+        *,
+        direct_route: DirectRoute,
+        allow_private: bool,
+        **connection_pool_kw,
     ):
-        self.source_ip = source_ip
-        self.interface = interface
-        self.if_index = if_index
-        super().__init__(*args, **kwargs)
+        self.direct_route = direct_route
+        self.allow_private = allow_private
+        super().__init__(
+            num_pools=num_pools,
+            maxsize=maxsize,
+            block=block,
+            **connection_pool_kw,
+        )
+        self.pool_classes_by_scheme = self.pool_classes_by_scheme.copy()
+        self.pool_classes_by_scheme.update(
+            {
+                "http": DirectHTTPConnectionPool,
+                "https": DirectHTTPSConnectionPool,
+            }
+        )
+
+    def _new_pool(self, scheme, host, port, request_context):
+        pool = super()._new_pool(scheme, host, port, request_context)
+        pool.direct_route = self.direct_route
+        pool.allow_private = self.allow_private
+        return pool
+
+
+class DirectAdapter(HTTPAdapter):
+    def __init__(self, route: DirectRoute, *, allow_private: bool, **kwargs):
+        self.direct_route = route
+        self.allow_private = allow_private
+        self.source_ip = route.source_ip
+        self.interface = route.interface
+        self.if_index = route.if_index
+        super().__init__(**kwargs)
 
     def init_poolmanager(
         self,
@@ -510,35 +633,25 @@ class SourceAddressAdapter(HTTPAdapter):
         block: bool = False,
         **pool_kwargs,
     ) -> None:
-        pool_kwargs["source_address"] = (self.source_ip, 0)
         pin = _pin_value(self.interface, self.if_index)
-        if pin:
-            pool_kwargs["socket_options"] = [
-                (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-                pin,
-            ]
-        self.poolmanager = PoolManager(
+        if pin is None:
+            raise DirectNetworkError("无法钉定物理网卡，直连会话已拒绝启动")
+        pool_kwargs["source_address"] = (self.source_ip, 0)
+        pool_kwargs["socket_options"] = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+            pin,
+        ]
+        self.poolmanager = DirectPoolManager(
             num_pools=connections,
             maxsize=maxsize,
             block=block,
+            direct_route=self.direct_route,
+            allow_private=self.allow_private,
             **pool_kwargs,
         )
 
-
-def create_bound_session(
-    source_ip: str,
-    interface: str = "",
-    if_index: int = 0,
-) -> requests.Session:
-    session = requests.Session()
-    session.trust_env = False
-    session.mount(
-        "http://", SourceAddressAdapter(source_ip, interface=interface, if_index=if_index)
-    )
-    session.mount(
-        "https://", SourceAddressAdapter(source_ip, interface=interface, if_index=if_index)
-    )
-    return session
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        raise DirectNetworkError("直连会话不允许显式代理")
 
 
 @dataclass(slots=True)
@@ -553,41 +666,47 @@ class DirectRoute:
     def discover(cls) -> "DirectRoute":
         try:
             adapter_configs = discover_adapter_configs()
-        except (OSError, subprocess.SubprocessError):
-            adapter_configs = []
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise DirectNetworkError(f"无法枚举物理网卡：{exc}") from exc
 
         adapter_configs.sort(key=_adapter_preference)
-        if adapter_configs:
-            routes = [
-                cls(
-                    config.source_ip,
-                    _merge_dns_servers(config.dns_servers, DIRECT_DNS_SERVERS),
-                    config.interface,
-                    config.if_index,
-                )
-                for config in adapter_configs
-            ]
-        else:
-            routes = [cls(source_ip) for source_ip in local_ipv4_candidates()]
-
+        routes = [
+            cls(
+                config.source_ip,
+                _merge_dns_servers(config.dns_servers, DIRECT_DNS_SERVERS),
+                config.interface,
+                config.if_index,
+            )
+            for config in adapter_configs
+        ]
         if not routes:
             raise DirectNetworkError(
-                "未找到校园网物理网卡；请确认已连接校园有线网络或 SZU_WLAN"
+                "未找到可钉定的校园网物理网卡；请确认已连接校园有线网络或 SZU_WLAN"
             )
 
+        errors: list[str] = []
         for route in routes:
             try:
+                if _pin_value(route.interface, route.if_index) is None:
+                    raise DirectNetworkError("接口索引不可用")
                 route.resolve("net.szu.edu.cn")
                 return route
-            except DirectNetworkError:
-                continue
+            except (OSError, DirectNetworkError) as exc:
+                errors.append(f"{route.interface}: {exc}")
         raise DirectNetworkError(
-            "无法通过物理网卡进行直连 DNS 查询；请检查校园网连接"
+            "无法通过物理网卡进行直连 DNS 查询（" + "；".join(errors) + "）"
         )
 
     def resolve(self, hostname: str) -> list[str]:
+        hostname = hostname.rstrip(".").lower()
+        try:
+            ipaddress.ip_address(hostname)
+            return [hostname]
+        except ValueError:
+            pass
         if hostname in self._cache:
             return self._cache[hostname]
+
         errors: list[str] = []
         for server in self.dns_servers:
             try:
@@ -603,26 +722,13 @@ class DirectRoute:
                     return addresses
             except (OSError, DirectNetworkError) as exc:
                 errors.append(type(exc).__name__)
-        detail = "/".join(errors) or "无 A 记录"
+        detail = "/".join(errors) or "无属于查询名的 A 记录"
         raise DirectNetworkError(f"无法直连解析 {hostname}（{detail}）")
 
-    def session(self) -> requests.Session:
-        return create_bound_session(self.source_ip, self.interface, self.if_index)
-
-    def rewrite_url(self, url: str) -> tuple[str, str]:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-        if not hostname:
-            raise DirectNetworkError(f"无效的检测地址：{url}")
-        try:
-            ipaddress.ip_address(hostname)
-            return url, hostname
-        except ValueError:
-            pass
-
-        address = self.resolve(hostname)[0]
-        port = f":{parsed.port}" if parsed.port else ""
-        rewritten = urlunsplit(
-            (parsed.scheme, f"{address}{port}", parsed.path, parsed.query, parsed.fragment)
-        )
-        return rewritten, hostname
+    def session(self, *, allow_private: bool = False) -> requests.Session:
+        session = requests.Session()
+        session.trust_env = False
+        adapter = DirectAdapter(self, allow_private=allow_private)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
